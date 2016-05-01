@@ -5,18 +5,23 @@
 #include <stdio.h>
 #include <sys/time.h>
 
+#define NX 32
+#define NY 32
+
 #define DX 0.05
 #define DY 0.05
 #define NSTEPS 1000
 
 #define ALPHA 1.0
-#define DT 0.1
+#define DT 0.0001
 
 #define NWORKSP 3
+#define OUTPUT_FREQ 100
 typedef struct {
+	int offset[2]; // offset for local field block	
 	int dims[2];
 	size_t size;
-	shared double *sh_v;
+	shared[] double *sh_v;
 	double *v;
 } field_t;
 
@@ -24,17 +29,17 @@ typedef struct {
 	int th_id, th_size;
 	int dims[2]; // Global dims
 	size_t size; // Global size
-	int block_offset[2]; // offset for local field block
 	shared field_t *sh_field;
 	field_t *field;
 } pfield_t;
 
 
-void field_ctor( field_t *this_, int *dims_ )
+void field_ctor( field_t *this_, int *dims_, int *offset_ )
 {
 	memcpy(this_->dims, dims_, sizeof(this_->dims));
+	memcpy(this_->offset, offset_, sizeof(this_->offset));
 	this_->size = dims_[0]*dims_[1];
-	this_->sh_v = (shared double *)upc_alloc(this_->size*sizeof(*this_->v));
+	this_->sh_v = (shared[] double *)upc_alloc(this_->size*sizeof(*this_->v));
 	this_->v = (double *)&this_->sh_v[0];
 }
 
@@ -55,6 +60,7 @@ void pfield_ctor( pfield_t *this_, int th_id_, int th_size_, int *dims_ )
 {
 	int dims_th[] = { dims_[0]/th_size_ + (1 ? th_id_ < dims_[0]%th_size_ : 0),
 			  dims_[1] };
+	int offset_th[] = { 0, 0 };
 	int i;
 	
 	this_->th_id   = th_id_;
@@ -62,16 +68,16 @@ void pfield_ctor( pfield_t *this_, int th_id_, int th_size_, int *dims_ )
 	memcpy(this_->dims, dims_, sizeof(this_->dims));
 	this_->size = dims_[0]*dims_[1];
 
-	memset(this_->block_offset, 0, sizeof(this_->block_offset));
+	memset(offset_th, 0, sizeof(offset_th));
 	for( i=0; i<this_->th_id; i++ ) {
-		this_->block_offset[0] += dims_[0]/th_size_ + (1 ? i < dims_[0]%th_size_ : 0);
+		offset_th[0] += dims_[0]/th_size_ + (1 ? i < dims_[0]%th_size_ : 0);
 	}
 
 	this_->sh_field = (shared field_t *)upc_all_alloc(th_size_,sizeof(field_t));
 	this_->field = (field_t *)&this_->sh_field[th_id_];
 	
 	// Determine the local thread info
-	field_ctor(this_->field, dims_th);
+	field_ctor(this_->field, dims_th, offset_th);
 
 	upc_barrier;
 }
@@ -92,8 +98,8 @@ void pfield_set( pfield_t *this_, double v_ )
 {
 	field_t *f = this_->field;
 	const double *v_end = f->v + f->size;
-	double *v;
-	for( v = f->v; v<v_end; v++ ) *(v++) = v_;
+	double *v = f->v;
+	while( v < v_end ) *(v++) = v_;
 
 	upc_barrier;	
 }
@@ -105,7 +111,7 @@ inline size_t pfield_eval_index(const pfield_t *this_, int i_, int j_ )
 
 inline size_t pfield_eval_index_local(const pfield_t *this_, int i_, int j_ )
 {
-	return (size_t)(i_+this_->block_offset[0])*this_->dims[1] + j_;
+	return (size_t)(i_+this_->field->offset[0])*this_->dims[1] + j_;
 }
 
 inline size_t sh_field_eval_index(const shared field_t *this_, int i_, int j_ )
@@ -125,7 +131,7 @@ void pfield_eval_ddx( const pfield_t *this_, pfield_t *ddx_ )
 	const double *v_im1, *v_ip1;
 
 	const shared field_t *f_nbr;
-	const shared double *sh_v_im1, *sh_v_ip1;
+	const shared[] double *sh_v_im1, *sh_v_ip1;
 	
 	int i,j,ii;
 
@@ -272,6 +278,74 @@ void pfield_add( pfield_t *this_, const pfield_t *g_ )
 	upc_barrier;
 }
 
+void pfield_write_file( const pfield_t *this_, const char *fname_ )
+{
+	shared field_t *sh_f;
+	shared[] double *sh_v;
+	double *v;
+
+	int i,j,ii, n;
+
+	FILE *fid = fopen(fname_,"w");
+	
+	for( n=0; n<this_->th_size; n++ ) {
+
+		sh_f = this_->sh_field + n;
+		sh_v = sh_f->sh_v;
+
+		/* printf("sh_f->size = %zd\n", sh_f->size); */
+
+		/* for( i=0; i<sh_f->size; i++ ) { */
+		/* 	fprintf(fid,"%15.7e\n", sh_v[i]); */
+		/* } */
+		for( i=0; i<sh_f->dims[0]; i++ ) {
+			for( j=0; j<sh_f->dims[1]; j++ ) {
+				ii = sh_field_eval_index( sh_f, i, j);
+				fprintf(fid,"%15.7e %15.7e %15.7e\n", (i+sh_f->offset[0])*DX, j*DY, sh_v[ii]);
+			}
+			fprintf(fid,"\n");
+			fflush(fid);
+		}
+	}
+	fclose(fid);
+}
+
+void set_bc( pfield_t *T_ )
+{
+	field_t *f = T_->field;
+	double *v = f->v;
+	int i,j,ii;
+	
+	if( T_->th_id == 0 ) {
+		i=0;
+		ii = field_eval_index(f,i,0);
+		for( j=0; j<f->dims[1]; j++ ) {
+			v[ii++] = 0.0;
+		}
+	}
+	
+	if( T_->th_id == T_->th_size - 1 ) {
+		i=f->dims[0]-1;
+		ii = field_eval_index(f,i,0);
+		for( j=0; j<f->dims[1]; j++ ) {
+			v[ii++] = 0.0;
+		}
+	}
+
+	for( i=0; i<f->dims[0]; i++ ) {
+		j=0;
+		ii = field_eval_index(f,i,j);
+		v[ii] = 0.0;
+
+		j=f->dims[1]-1;
+		//printf("ii = %d\n", ii);		
+		ii = field_eval_index(f,i,j);
+		v[ii] = 1.0;
+	}
+
+	upc_barrier;
+}
+
 int main(void)
 {
 
@@ -279,7 +353,7 @@ int main(void)
 	pfield_t ws[3];
 
 	int i,n;
-	int dims[] = { 1099, 1024 };
+	int dims[] = { NX, NY };
 	
 	pfield_ctor(&T, MYTHREAD, THREADS, dims);
 	pfield_ctor(&D, MYTHREAD, THREADS, dims );
@@ -288,6 +362,25 @@ int main(void)
 		pfield_ctor(ws+n, MYTHREAD, THREADS, dims );
 	
 	pfield_set(&T,0.0);
+	set_bc(&T);
+
+	{
+		char fname[64];
+		sprintf(fname,"T-init-%d.dat", T.th_id);
+		FILE *fid = fopen(fname,"w");
+		int i,j,ii;
+		ii=0;
+		for( i=0; i<T.field->dims[0]; i++ ) {
+			for( j=0; j<T.field->dims[1]; j++ ) {
+				fprintf(fid,"%15.7e\n", T.field->v[ii]);
+				ii++;
+			}
+		}
+		fclose(fid);
+	}
+
+	if( MYTHREAD == 0 ) 
+		pfield_write_file( &T, "T-init.dat" );
 
 	for( n=0; n<NSTEPS; n++ ) {
 		pfield_eval_lap( &T, NWORKSP, ws, &D);
@@ -295,13 +388,20 @@ int main(void)
 
 		// Perform update
 		pfield_add( &T, &D );
+		set_bc(&T);		
 
 		if( n % 10 == 0 && MYTHREAD == 0 )  {
 			printf("Completed %6.3f%%\n", 100.0*(double)n / NSTEPS);
 		}
-		//if( n % OUTPUT_FREQ == 0 ) {
-			//write the output;
-		//} w
+		if( n % OUTPUT_FREQ == 0 ) {
+			if( MYTHREAD == 0 ) {
+				char fname[64];
+				sprintf(fname,"T-%d.dat", n);
+				pfield_write_file( &T, fname);
+			}
+			upc_barrier;
+		}
+
 
 	
 	}
