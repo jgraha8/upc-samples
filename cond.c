@@ -1,50 +1,92 @@
 #include <upc_relaxed.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <stdbool.h>
 
-#define NX 32
-#define NY 32
+#define NX 256
+#define NY 256
 
 #define DX 0.05
 #define DY 0.05
-#define NSTEPS 1000
+#define NSTEPS 100000
 
 #define ALPHA 1.0
 #define DT 0.0001
 
 #define NWORKSP 3
-#define OUTPUT_FREQ 100
+#define OUTPUT_FREQ 10000
+
+static bool buffer_shared = false;
+
 typedef struct {
-	int offset[2]; // offset for local field block	
+	struct timeval stop, start;
+	double time;
+} uclock_t;
+
+double uclock_time( const uclock_t *this_ )
+{
+	const double c = pow(10.0,-6.0);
+	return ((double)(this_->stop.tv_sec + c*this_->stop.tv_usec -
+			 this_->start.tv_sec - c*this_->start.tv_usec));
+}
+
+void uclock_start( uclock_t *this_ )
+{
+	gettimeofday(&this_->start, NULL);
+}
+
+void uclock_stop( uclock_t *this_ )
+{
+	gettimeofday(&this_->stop, NULL);
+	this_->time = uclock_time(this_);
+	
+}
+
+
+void uclock_split_stop( uclock_t *this_ )
+{
+	gettimeofday(&this_->stop, NULL);
+	this_->time += uclock_time(this_);
+	
+}
+
+
+
+typedef struct {
 	int dims[2];
 	size_t size;
 	shared[] double *sh_v;
 	double *v;
+	double *__v_nbr; // Buffer for holding neighbor values
 } field_t;
 
 typedef struct {
 	int th_id, th_size;
 	int dims[2]; // Global dims
 	size_t size; // Global size
+	shared[2] int (*sh_offset)[2]; // offset for local field block
+	int (*offset)[2];
 	shared field_t *sh_field;
 	field_t *field;
 } pfield_t;
 
 
-void field_ctor( field_t *this_, int *dims_, int *offset_ )
+void field_ctor( field_t *this_, int *dims_ )
 {
 	memcpy(this_->dims, dims_, sizeof(this_->dims));
-	memcpy(this_->offset, offset_, sizeof(this_->offset));
 	this_->size = dims_[0]*dims_[1];
 	this_->sh_v = (shared[] double *)upc_alloc(this_->size*sizeof(*this_->v));
 	this_->v = (double *)&this_->sh_v[0];
+	this_->__v_nbr = (double *)malloc(dims_[1]*sizeof(double));
 }
 
 void field_dtor( field_t *this_ )
 {
+	free(this_->__v_nbr);
 	this_->v = NULL;
 	upc_free(this_->sh_v);
 	this_->size = 0;
@@ -58,27 +100,39 @@ inline size_t field_eval_index(const field_t *this_, int i_, int j_ )
 
 void pfield_ctor( pfield_t *this_, int th_id_, int th_size_, int *dims_ )
 {
-	int dims_th[] = { dims_[0]/th_size_ + (1 ? th_id_ < dims_[0]%th_size_ : 0),
-			  dims_[1] };
-	int offset_th[] = { 0, 0 };
+	shared[2] int (*sh_dims_th)[2] = (shared[2] int (*)[2])upc_all_alloc(th_size_,sizeof(int [2]));
 	int i;
-	
+
+	// Set the thread info and global parameters
 	this_->th_id   = th_id_;
 	this_->th_size = th_size_;
 	memcpy(this_->dims, dims_, sizeof(this_->dims));
-	this_->size = dims_[0]*dims_[1];
+	this_->size = dims_[0]*dims_[1]; 
 
-	memset(offset_th, 0, sizeof(offset_th));
-	for( i=0; i<this_->th_id; i++ ) {
-		offset_th[0] += dims_[0]/th_size_ + (1 ? i < dims_[0]%th_size_ : 0);
+	// Set the thread dimensions in the shared vector
+	sh_dims_th[th_id_][0] = dims_[0]/th_size_ + (1 ? th_id_ < dims_[0]%th_size_ : 0); // Remaining dimensions are thread cyclic
+	sh_dims_th[th_id_][1] = dims_[1];
+
+	this_->sh_offset = (shared[2] int (*)[2])upc_all_alloc(th_size_,sizeof(int [2]));
+	this_->offset = (int (*)[2])(this_->sh_offset + th_id_);
+	memset( this_->offset, 0, sizeof(int [2]));
+
+	upc_barrier;
+
+	for( i=1; i<th_size_; i++ ) {	
+		if( i == th_id_ ) {
+			this_->sh_offset[i][0] = this_->sh_offset[i-1][0] + sh_dims_th[i-1][0];
+		}
+		upc_barrier;
 	}
 
 	this_->sh_field = (shared field_t *)upc_all_alloc(th_size_,sizeof(field_t));
-	this_->field = (field_t *)&this_->sh_field[th_id_];
+	this_->field = (field_t *)(this_->sh_field + th_id_);
 	
 	// Determine the local thread info
-	field_ctor(this_->field, dims_th, offset_th);
+	field_ctor(this_->field, (int *)sh_dims_th[th_id_]);
 
+	upc_all_free(sh_dims_th);
 	upc_barrier;
 }
 
@@ -104,85 +158,125 @@ void pfield_set( pfield_t *this_, double v_ )
 	upc_barrier;	
 }
 
-inline size_t pfield_eval_index(const pfield_t *this_, int i_, int j_ )
+// Returns the local block vector index for a given thread reference
+inline size_t pfield_local_index_th(const pfield_t *this_, int th_id_, int i_, int j_ )
 {
-	return (size_t)i_*this_->dims[1] + j_;
+	return (size_t)i_*this_->sh_field[th_id_].dims[1] + j_;
 }
 
-inline size_t pfield_eval_index_local(const pfield_t *this_, int i_, int j_ )
+inline void pfield_eval_ij_th(const pfield_t *this_, int th_id_, int i_th_, int j_th_, int *i_, int *j_ )
 {
-	return (size_t)(i_+this_->field->offset[0])*this_->dims[1] + j_;
+	*i_ = i_th_ + this_->sh_offset[th_id_][0];
+	*j_ = j_th_;
 }
 
-inline size_t sh_field_eval_index(const shared field_t *this_, int i_, int j_ )
-{
-	return (size_t)i_*this_->dims[1] + j_;
-}
+/* inline size_t pfield_eval_index(const pfield_t *this_, int i_, int j_ ) */
+/* { */
+/* 	return (size_t)i_*this_->dims[1] + j_; */
+/* } */
 
-void pfield_eval_ddx( const pfield_t *this_, pfield_t *ddx_ )
+/* inline size_t pfield_eval_shth_index(const pfield_t *this_, int th_id_, int i_, int j_ ) */
+/* { */
+/* 	return eval_sh_field_index( this_->sh_field[th_id_], i_, j_ ); */
+/* } */
+
+/* inline size_t pfield_eval_index_th(const pfield_t *this_, int i_, int j_ ) */
+/* { */
+/* 	return (size_t)(i_ + this_->offset[0])*this_->dims[1] + j_; */
+/* } */
+
+/* inline size_t pfield_eval_index_shth(const pfield_t *this_, int th_id_, int i_, int j_ ) */
+/* { */
+/* 	return (size_t)(i_ + this_->sh_offset[th_id_][0])*this_->dims[1] + j_; */
+/* } */
+
+
+void pfield_eval_ddx( pfield_t *this_, pfield_t *ddx_ )
 {
 	assert( this_->dims[0] == ddx_->dims[0] &&
 		this_->dims[1] == ddx_->dims[1] );
 
 	const field_t *f=this_->field;
-
         double *dv = ddx_->field->v;
 	
-	const double *v_im1, *v_ip1;
+	double *v_im1, *v_ip1;
 
+	int th_id_nbr;
 	const shared field_t *f_nbr;
 	const shared[] double *sh_v_im1, *sh_v_ip1;
 	
-	int i,j,ii;
+	int i,j,idx;
 
 	for(i=1; i<f->dims[0]-1; i++ ) {
 		v_im1 = f->v + field_eval_index(f,i-1,0);
 		v_ip1 = f->v + field_eval_index(f,i+1,0);
-		ii = field_eval_index(f,i,0);
+		idx = field_eval_index(f,i,0);
 		for( j=0; j<f->dims[1]; j++ ) {
-			dv[ii++] = 0.5*(v_ip1[j] - v_im1[j]) / DX;
+			dv[idx++] = 0.5*(v_ip1[j] - v_im1[j]) / DX;
 		}
 	}
 
 
 	// Left inter-thread boundary
 	if( 0 < this_->th_id ) {
+
 		i = 0;
 		v_ip1 = f->v + field_eval_index(f,i+1,0);
+		v_im1 = f->__v_nbr;
 
-		f_nbr = this_->sh_field + this_->th_id - 1;
-		sh_v_im1 = f_nbr->sh_v + sh_field_eval_index(f_nbr,f_nbr->dims[0]-1,0);
+		th_id_nbr = this_->th_id - 1;
+		f_nbr = this_->sh_field + th_id_nbr;
+		sh_v_im1 = f_nbr->sh_v + pfield_local_index_th( this_, th_id_nbr, f_nbr->dims[0]-1, 0);
 
-		ii = field_eval_index(f,i,0);
-		for( j=0; j<f->dims[1]; j++ ) {
-			dv[ii++] = 0.5*(v_ip1[j] - sh_v_im1[j]) / DX;
-		}	
+		idx = field_eval_index(f,i,0);
+		if( buffer_shared ) {
+			upc_memget( v_im1, sh_v_im1, f->dims[1]*sizeof(double) );		
+
+			for( j=0; j<f->dims[1]; j++ ) {	
+				dv[idx++] = 0.5*(v_ip1[j] - v_im1[j]) / DX;
+			}
+		} else {
+			for( j=0; j<f->dims[1]; j++ ) {	
+				dv[idx++] = 0.5*(v_ip1[j] - sh_v_im1[j]) / DX;
+			}
+		}
 		
 	}
 	
 	// Right inter-thread boundary
 	if( this_->th_id < this_->th_size-1 ) {
-		
-		i = f->dims[0]-1;
-		v_im1    = f->v + field_eval_index(f,i-1,0); // Local vector
-		
-		f_nbr   = this_->sh_field + this_->th_id+1; // Neighbor thread
-		sh_v_ip1 = f_nbr->sh_v + sh_field_eval_index(f_nbr,0,0);
 
-		ii = field_eval_index(f,i,0);
-		for( j=0; j<f->dims[1]; j++ ) {
-			dv[ii++] = 0.5*(sh_v_ip1[j] - v_im1[j]) / DX;
-		}	
+		i = f->dims[0]-1;
+		v_ip1 = f->__v_nbr;
+		v_im1 = f->v + field_eval_index(f,i-1,0); // Local vector
+
+		th_id_nbr = this_->th_id+1;
+		f_nbr     = this_->sh_field + th_id_nbr; // Neighbor thread
+		sh_v_ip1  = f_nbr->sh_v + pfield_local_index_th( this_, th_id_nbr, 0, 0 );
+
+		idx = field_eval_index(f,i,0);
+
+		if( buffer_shared ) {
+			upc_memget( v_ip1, sh_v_ip1, f->dims[1]*sizeof(double) );		
+
+			for( j=0; j<f->dims[1]; j++ ) {
+				dv[idx++] = 0.5*(v_ip1[j] - v_im1[j]) / DX;
+			}
+		} else {
+			for( j=0; j<f->dims[1]; j++ ) {
+				dv[idx++] = 0.5*(sh_v_ip1[j] - v_im1[j]) / DX;
+			}
+		}
 	}
 	
 	// Left physical boundary
 	if( this_->th_id == 0 ) {
 		i = 0;
 		v_ip1 = f->v + field_eval_index(f,i+1,0);		
-		ii = field_eval_index(f,i,0);
+		idx = field_eval_index(f,i,0);
 		for( j=0; j<f->dims[1]; j++ ) {
-			dv[ii] = ( v_ip1[j] - f->v[ii] ) / DX;
-			ii++;
+			dv[idx] = ( v_ip1[j] - f->v[idx] ) / DX;
+			idx++;
 		}
 	}
 
@@ -191,10 +285,10 @@ void pfield_eval_ddx( const pfield_t *this_, pfield_t *ddx_ )
 		i = f->dims[0]-1;
 		v_im1 = f->v + field_eval_index(f,i-1,0);
 		
-		ii = field_eval_index(f,i,0);
+		idx = field_eval_index(f,i,0);
 		for( j=0; j<f->dims[1]; j++ ) {
-			dv[ii] = ( f->v[ii] - v_im1[j] ) / DX;
-			ii++;
+			dv[idx] = ( f->v[idx] - v_im1[j] ) / DX;
+			idx++;
 		}
 	}
 
@@ -211,28 +305,28 @@ void pfield_eval_ddy( const pfield_t *this_, pfield_t *ddy_ )
 	const double *v = f->v;
         double *dv = ddy_->field->v;
 	
-	int i,j,ii;
+	int i,j,idx;
 
 	for( i=0; i<f->dims[0]; i++ ) {
 		// j=0
 		j=0;
-		ii = field_eval_index(f,i,j);
-		dv[ii] = ( v[ii+1] - v[ii] ) / DY;
+		idx = field_eval_index(f,i,j);
+		dv[idx] = ( v[idx+1] - v[idx] ) / DY;
 
 		for( j=1; j<f->dims[1]-1; j++ ) {
-			ii++;
-			dv[ii] = 0.5*( v[ii+1] - v[ii-1] ) / DY;
+			idx++;
+			dv[idx] = 0.5*( v[idx+1] - v[idx-1] ) / DY;
 		}
 
 		j=f->dims[1]-1;
-		ii = field_eval_index(f,i,j);
-		dv[ii] = ( v[ii] - v[ii-1] ) / DY;		
+		idx = field_eval_index(f,i,j);
+		dv[idx] = ( v[idx] - v[idx-1] ) / DY;		
 	}
 
 	upc_barrier;
 }
 
-void pfield_eval_lap( const pfield_t *this_, int nws_, pfield_t *ws_, pfield_t *lap_ )
+void pfield_eval_lap( pfield_t *this_, int nws_, pfield_t *ws_, pfield_t *lap_ )
 {
 	size_t i;
 	assert( nws_ >= 3 );
@@ -284,27 +378,21 @@ void pfield_write_file( const pfield_t *this_, const char *fname_ )
 	shared[] double *sh_v;
 	double *v;
 
-	int i,j,ii, n;
+	int i,j,idx, n;
+	int i_g, j_g;
 
 	FILE *fid = fopen(fname_,"w");
 	
 	for( n=0; n<this_->th_size; n++ ) {
-
-		sh_f = this_->sh_field + n;
-		sh_v = sh_f->sh_v;
-
-		/* printf("sh_f->size = %zd\n", sh_f->size); */
-
-		/* for( i=0; i<sh_f->size; i++ ) { */
-		/* 	fprintf(fid,"%15.7e\n", sh_v[i]); */
-		/* } */
+		sh_f      = this_->sh_field + n;
+		sh_v      = sh_f->sh_v;
 		for( i=0; i<sh_f->dims[0]; i++ ) {
+			pfield_eval_ij_th( this_, n, i, 0, &i_g, &j_g );			  
+			idx = pfield_local_index_th( this_, n, i, 0 );
 			for( j=0; j<sh_f->dims[1]; j++ ) {
-				ii = sh_field_eval_index( sh_f, i, j);
-				fprintf(fid,"%15.7e %15.7e %15.7e\n", (i+sh_f->offset[0])*DX, j*DY, sh_v[ii]);
+				fprintf(fid,"%15.7e %15.7e %15.7e\n", i_g*DX, (j_g++)*DY, sh_v[idx++]);
 			}
 			fprintf(fid,"\n");
-			fflush(fid);
 		}
 	}
 	fclose(fid);
@@ -346,14 +434,28 @@ void set_bc( pfield_t *T_ )
 	upc_barrier;
 }
 
-int main(void)
+int main(int argc_, char *argv_[])
 {
 
 	pfield_t T, D;
 	pfield_t ws[3];
+	uclock_t clock;
+	clock.time = 0.0;
 
 	int i,n;
 	int dims[] = { NX, NY };
+
+	n=1;
+	while( n < argc_ ) {
+		if( strncmp(argv_[n], "-b", 2) == 0 ) {
+			buffer_shared = true;
+			if( MYTHREAD == 0 )
+				printf("Buffering shared\n");
+		} else {
+			printf("unknown argument: %s\n", argv_[n]);
+		}
+		n++;	
+	}
 	
 	pfield_ctor(&T, MYTHREAD, THREADS, dims);
 	pfield_ctor(&D, MYTHREAD, THREADS, dims );
@@ -364,34 +466,28 @@ int main(void)
 	pfield_set(&T,0.0);
 	set_bc(&T);
 
-	{
-		char fname[64];
-		sprintf(fname,"T-init-%d.dat", T.th_id);
-		FILE *fid = fopen(fname,"w");
-		int i,j,ii;
-		ii=0;
-		for( i=0; i<T.field->dims[0]; i++ ) {
-			for( j=0; j<T.field->dims[1]; j++ ) {
-				fprintf(fid,"%15.7e\n", T.field->v[ii]);
-				ii++;
-			}
-		}
-		fclose(fid);
-	}
-
 	if( MYTHREAD == 0 ) 
 		pfield_write_file( &T, "T-init.dat" );
 
 	for( n=0; n<NSTEPS; n++ ) {
+
+		upc_barrier;
+		if( MYTHREAD == 0 )
+			uclock_start( &clock );
+		
 		pfield_eval_lap( &T, NWORKSP, ws, &D);
 		pfield_mul_scalar( &D, DT*ALPHA );
 
 		// Perform update
 		pfield_add( &T, &D );
-		set_bc(&T);		
+		set_bc(&T);
 
-		if( n % 10 == 0 && MYTHREAD == 0 )  {
+		if( MYTHREAD == 0 )
+			uclock_split_stop( &clock );
+
+		if( n % (NSTEPS/100) == 0 && MYTHREAD == 0 )  {
 			printf("Completed %6.3f%%\n", 100.0*(double)n / NSTEPS);
+			fflush(stdout);
 		}
 		if( n % OUTPUT_FREQ == 0 ) {
 			if( MYTHREAD == 0 ) {
@@ -402,9 +498,11 @@ int main(void)
 			upc_barrier;
 		}
 
-
-	
 	}
+
+	if( MYTHREAD == 0 )
+		printf("Total wall time = %15.7e s\n", clock.time);
+	
 	for( n=0; n<NWORKSP; n++ )
 		pfield_dtor(ws+n);
 
